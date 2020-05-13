@@ -1,6 +1,6 @@
 module PostgRest exposing
     ( Schema, schema
-    , Attribute, string, int, float, bool, nullable
+    , Attribute, string, int, float, bool, datetime, nullable
     , attribute
     , Relationship, HasOne, hasOne, HasMany, hasMany, HasNullable, hasNullable
     , Request
@@ -17,7 +17,7 @@ module PostgRest exposing
     , Direction(..), Nulls(..), order
     , createOne, createMany, updateOne, updateMany, deleteOne, deleteMany
     , Changeset, change, batch
-    , toHttpRequest
+    , Error, toCmd, toTask
     )
 
 {-| Make PostgREST requests in Elm.
@@ -55,7 +55,7 @@ Before you can do anything interesting (ex. fetching resources), you must first 
 
 A Schema is made up of Attributes. An `Attribute` represents a single field of an exposed resource.
 
-@docs Attribute, string, int, float, bool, nullable
+@docs Attribute, string, int, float, bool, datetime, array, nullable
 
 
 ### Custom Attributes
@@ -96,7 +96,7 @@ Describe what fields and embeds you'd like to select. The API is pretty similar 
 
 ### Mapping Selections
 
-@docs map, map2, map3, map4, map5, map6, map7, map8
+@docs map, map2, map3, map4, map5, map6, map7, map8, map9
 
 
 ### Embed Selections
@@ -156,9 +156,12 @@ In addition to reading, we can perform the CRUD write operations.
 -}
 
 import Dict exposing (Dict)
-import Http
-import Json.Decode as Decode
-import Json.Encode as Encode
+import Http exposing (Metadata, Response(..), stringResolver)
+import Iso8601
+import Json.Decode as Decode exposing (Decoder)
+import Json.Encode as Encode exposing (Value)
+import Task exposing (Task)
+import Time exposing (Posix)
 import Url.Builder as Builder exposing (QueryParameter)
 
 
@@ -249,7 +252,7 @@ type Request a
         }
     | Page
         { parameters : Parameters
-        , expect : Http.Expect a
+        , handler : Response String -> Result Error a
         }
 
 
@@ -325,52 +328,52 @@ type Condition_
 
 
 {-
-   Abbreviation 	Meaning 	               Postgres Equivalent
+   Abbreviation  Meaning                 Postgres Equivalent
 
-   eq 	            equals 	                     =
-   gt 	            greater than                 >
-   gte 	            greater than or equal 	     >=
-   lt 	            less than 	                 <
-   lte 	            less than or equal 	         <=
-   neq 	            not equal 	                 <> or !=
+   eq               equals                       =
+   gt               greater than                 >
+   gte              greater than or equal        >=
+   lt               less than                    <
+   lte              less than or equal           <=
+   neq              not equal                    <> or !=
 
-   like 	        LIKE operator                LIKE
+   like             LIKE operator                LIKE
                     (use * in place of %)
 
-   ilike 	        ILIKE operator               ILIKE
+   ilike            ILIKE operator               ILIKE
                     (use * in place of %)
 
-   in 	            one of a list of values      IN
+   in               one of a list of values      IN
                     e.g. ?a=in.1,2,3
 
-   is 	            checking for exact           IS
+   is               checking for exact           IS
                     equality (null,true,false)
 
-   fts 	            full-text search using       @@
+   fts              full-text search using       @@
                     to_tsquery
 
-   cs 	            contains                     @>
+   cs               contains                     @>
                     e.g. ?tags=cs.{example, new}
 
-   cd 	            contained in                 <@
+   cd               contained in                 <@
                     e.g. ?values=cd.{1,2,3}
 
-   ov 	            overlap                      &&
+   ov               overlap                      &&
                     e.g. ?period=ov.[2017-01-01,2017-06-30]
 
-   sl 	            strictly left of,            <<
+   sl               strictly left of,            <<
                     e.g. ?range=sl.(1,10)
 
-   sr 	            strictly right of 	         >>
+   sr               strictly right of            >>
 
-   nxr 	            does not extend to the       &<
+   nxr              does not extend to the       &<
                     right of
                     e.g. ?range=nxr.(1,10)
 
-   nxl 	            does not extend to the       &>
+   nxl              does not extend to the       &>
                     left of
 
-   adj 	            is adjacent to,              -|-
+   adj              is adjacent to,              -|-
                     e.g. ?range=adj.(1,10)
 
 -}
@@ -488,6 +491,16 @@ int name =
         , decoder = Decode.int
         , encoder = Encode.int
         , toString = String.fromInt
+        }
+
+
+datetime : String -> Attribute Posix
+datetime columnName =
+    Attribute
+        { encoder = Iso8601.encode
+        , decoder = Iso8601.decoder
+        , name = columnName
+        , toString = Iso8601.fromTime
         }
 
 
@@ -1341,27 +1354,44 @@ readPage (Schema schemaName attributes) options =
                 , cardinality = cardinality
                 }
                 embeds
+    in
+    Page
+        { parameters = parameters
+        , handler = handlePageResponse decoder
+        }
 
-        handleResponse response =
+
+handlePageResponse : Decoder a -> Http.Response String -> Result Error { data : List a, count : Int }
+handlePageResponse decoder response =
+    case response of
+        BadUrl_ url ->
+            Err (BadUrl url)
+
+        Timeout_ ->
+            Err Timeout
+
+        NetworkError_ ->
+            Err NetworkError
+
+        BadStatus_ metadata body ->
+            Err <| BadStatus metadata body
+
+        GoodStatus_ metadata body ->
             let
                 countResult =
-                    Dict.get "Content-Range" response.headers
+                    Dict.get "Content-Range" metadata.headers
                         |> Maybe.andThen (String.split "/" >> List.reverse >> List.head)
                         |> Maybe.andThen String.toInt
                         |> Result.fromMaybe "Invalid Content-Range Header"
 
                 jsonResult =
-                    Decode.decodeString (Decode.list decoder) response.body
+                    Decode.decodeString (Decode.list decoder) body
                         |> Result.mapError Decode.errorToString
             in
             Result.map2 (\data count -> { data = data, count = count })
                 jsonResult
                 countResult
-    in
-    Page
-        { parameters = parameters
-        , expect = Http.expectStringResponse handleResponse
-        }
+                |> Result.mapError BadBody
 
 
 {-| -}
@@ -1517,16 +1547,24 @@ deleteMany (Schema name attributes) options =
 
 
 {-| -}
-toHttpRequest : { timeout : Maybe Float, token : Maybe String, url : String } -> Request a -> Http.Request a
-toHttpRequest { url, timeout, token } request =
+toCmd :
+    { timeout : Maybe Float
+    , token : Maybe String
+    , url : String
+    , toMsg : Result Error a -> msg
+    , tracker : Maybe String
+    }
+    -> Request a
+    -> Cmd msg
+toCmd { url, timeout, token, toMsg, tracker } request =
     let
-        ( authHeaders, withCredentials ) =
+        authHeaders =
             case token of
                 Just str ->
-                    ( [ Http.header "Authorization" ("Bearer " ++ str) ], True )
+                    [ Http.header "Authorization" ("Bearer " ++ str) ]
 
                 Nothing ->
-                    ( [], False )
+                    []
     in
     case request of
         Read { parameters, decoder } ->
@@ -1535,12 +1573,12 @@ toHttpRequest { url, timeout, token } request =
                 , headers = parametersToHeaders parameters ++ authHeaders
                 , url = parametersToUrl url parameters
                 , body = Http.emptyBody
-                , expect = Http.expectJson decoder
+                , expect = expectJson toMsg decoder
                 , timeout = timeout
-                , withCredentials = withCredentials
+                , tracker = tracker
                 }
 
-        Page { parameters, expect } ->
+        Page { parameters, handler } ->
             Http.request
                 { method = "GET"
                 , headers =
@@ -1549,9 +1587,9 @@ toHttpRequest { url, timeout, token } request =
                         ++ [ Http.header "Prefer" "count=exact" ]
                 , url = parametersToUrl url parameters
                 , body = Http.emptyBody
-                , expect = expect
+                , expect = Http.expectStringResponse toMsg handler
                 , timeout = timeout
-                , withCredentials = withCredentials
+                , tracker = tracker
                 }
 
         Update { parameters, decoder, value } ->
@@ -1560,9 +1598,9 @@ toHttpRequest { url, timeout, token } request =
                 , headers = parametersToHeaders parameters ++ authHeaders
                 , url = parametersToUrl url parameters
                 , body = Http.jsonBody value
-                , expect = Http.expectJson decoder
+                , expect = expectJson toMsg decoder
                 , timeout = timeout
-                , withCredentials = withCredentials
+                , tracker = tracker
                 }
 
         Create { parameters, decoder, value } ->
@@ -1571,9 +1609,9 @@ toHttpRequest { url, timeout, token } request =
                 , headers = parametersToHeaders parameters ++ authHeaders
                 , url = parametersToUrl url parameters
                 , body = Http.jsonBody value
-                , expect = Http.expectJson decoder
+                , expect = expectJson toMsg decoder
                 , timeout = timeout
-                , withCredentials = withCredentials
+                , tracker = tracker
                 }
 
         Delete { parameters, decoder } ->
@@ -1582,10 +1620,120 @@ toHttpRequest { url, timeout, token } request =
                 , headers = parametersToHeaders parameters ++ authHeaders
                 , url = parametersToUrl url parameters
                 , body = Http.emptyBody
-                , expect = Http.expectJson decoder
+                , expect = expectJson toMsg decoder
                 , timeout = timeout
-                , withCredentials = withCredentials
+                , tracker = tracker
                 }
+
+
+toTask :
+    { timeout : Maybe Float
+    , token : Maybe String
+    , url : String
+    , tracker : Maybe String
+    }
+    -> Request a
+    -> Task Error a
+toTask { url, timeout, token, tracker } request =
+    let
+        authHeaders =
+            case token of
+                Just str ->
+                    [ Http.header "Authorization" ("Bearer " ++ str) ]
+
+                Nothing ->
+                    []
+    in
+    case request of
+        Read { parameters, decoder } ->
+            Http.task
+                { method = "GET"
+                , headers = parametersToHeaders parameters ++ authHeaders
+                , url = parametersToUrl url parameters
+                , body = Http.emptyBody
+                , timeout = timeout
+                , resolver = stringResolver <| resolution decoder
+                }
+
+        Page { parameters, handler } ->
+            Http.task
+                { method = "GET"
+                , headers =
+                    parametersToHeaders parameters
+                        ++ authHeaders
+                        ++ [ Http.header "Prefer" "count=exact" ]
+                , url = parametersToUrl url parameters
+                , body = Http.emptyBody
+                , timeout = timeout
+                , resolver = stringResolver handler
+                }
+
+        Update { parameters, decoder, value } ->
+            Http.task
+                { method = "PATCH"
+                , headers = parametersToHeaders parameters ++ authHeaders
+                , url = parametersToUrl url parameters
+                , body = Http.jsonBody value
+                , timeout = timeout
+                , resolver = stringResolver <| resolution decoder
+                }
+
+        Create { parameters, decoder, value } ->
+            Http.task
+                { method = "POST"
+                , headers = parametersToHeaders parameters ++ authHeaders
+                , url = parametersToUrl url parameters
+                , body = Http.jsonBody value
+                , timeout = timeout
+                , resolver = stringResolver <| resolution decoder
+                }
+
+        Delete { parameters, decoder } ->
+            Http.task
+                { method = "DELETE"
+                , headers = parametersToHeaders parameters ++ authHeaders
+                , url = parametersToUrl url parameters
+                , body = Http.emptyBody
+                , timeout = timeout
+                , resolver = stringResolver <| resolution decoder
+                }
+
+
+expectJson : (Result Error a -> msg) -> Decoder a -> Http.Expect msg
+expectJson toMsg decoder =
+    Http.expectStringResponse toMsg (resolution decoder)
+
+
+resolution : Decoder a -> Http.Response String -> Result Error a
+resolution decoder response =
+    case response of
+        Http.BadUrl_ url_ ->
+            Err <| BadUrl url_
+
+        Http.Timeout_ ->
+            Err Timeout
+
+        Http.NetworkError_ ->
+            Err NetworkError
+
+        Http.BadStatus_ metadata body ->
+            Err <| BadStatus metadata body
+
+        Http.GoodStatus_ _ body ->
+            case Decode.decodeString decoder body of
+                Ok value_ ->
+                    Ok value_
+
+                Err err ->
+                    Err <| BadBody <| Decode.errorToString err
+
+
+type Error
+    = Timeout
+    | BadUrl String
+    | NetworkError
+    | BadStatus Metadata String
+    | BadBody String
 
 
 parametersToHeaders : Parameters -> List Http.Header
