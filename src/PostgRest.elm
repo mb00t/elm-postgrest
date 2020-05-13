@@ -55,7 +55,7 @@ Before you can do anything interesting (ex. fetching resources), you must first 
 
 A Schema is made up of Attributes. An `Attribute` represents a single field of an exposed resource.
 
-@docs Attribute, string, int, float, bool, datetime, array, nullable
+@docs Attribute, string, int, float, bool, datetime, nullable
 
 
 ### Custom Attributes
