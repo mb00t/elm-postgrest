@@ -1559,12 +1559,7 @@ toCmd :
 toCmd { url, timeout, token, toMsg, tracker } request =
     let
         authHeaders =
-            case token of
-                Just str ->
-                    [ Http.header "Authorization" ("Bearer " ++ str) ]
-
-                Nothing ->
-                    []
+            authHeadersFromToken token
     in
     case request of
         Read { parameters, decoder } ->
@@ -1636,12 +1631,7 @@ toTask :
 toTask { url, timeout, token } request =
     let
         authHeaders =
-            case token of
-                Just str ->
-                    [ Http.header "Authorization" ("Bearer " ++ str) ]
-
-                Nothing ->
-                    []
+            authHeadersFromToken token
     in
     case request of
         Read { parameters, decoder } ->
@@ -2192,3 +2182,13 @@ binaryLogicalOperatorToString binop =
 
         Or ->
             "or"
+
+
+authHeadersFromToken : Maybe String -> List Http.Header
+authHeadersFromToken token =
+    case token of
+        Just str ->
+            [ Http.header "Authorization" <| "Bearer " ++ str ]
+
+        Nothing ->
+            []
