@@ -1630,11 +1630,10 @@ toTask :
     { timeout : Maybe Float
     , token : Maybe String
     , url : String
-    , tracker : Maybe String
     }
     -> Request a
     -> Task Error a
-toTask { url, timeout, token, tracker } request =
+toTask { url, timeout, token } request =
     let
         authHeaders =
             case token of
